@@ -1,0 +1,545 @@
+name: Build APK
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.7
+      - name: Write project files
+        run: |
+          mkdir -p Stillpoint && cd Stillpoint
+          mkdir -p "$(dirname 'app/build.gradle.kts')"
+          cat > 'app/build.gradle.kts' <<'STILLPOINT_EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "com.stillpoint.app"
+              compileSdk = 34
+
+              defaultConfig {
+                  applicationId = "com.stillpoint.app"
+                  minSdk = 26
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              buildTypes {
+                  release { isMinifyEnabled = false }
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          STILLPOINT_EOF
+          mkdir -p "$(dirname 'app/src/main/AndroidManifest.xml')"
+          cat > 'app/src/main/AndroidManifest.xml' <<'STILLPOINT_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android"
+              xmlns:tools="http://schemas.android.com/tools">
+
+              <uses-permission android:name="android.permission.PACKAGE_USAGE_STATS"
+                  tools:ignore="ProtectedPermissions" />
+              <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+              <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+
+              <queries>
+                  <intent>
+                      <action android:name="android.intent.action.MAIN" />
+                      <category android:name="android.intent.category.LAUNCHER" />
+                  </intent>
+              </queries>
+
+              <application
+                  android:allowBackup="false"
+                  android:icon="@android:drawable/ic_lock_idle_alarm"
+                  android:label="@string/app_name"
+                  android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
+
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <activity
+                      android:name=".PauseActivity"
+                      android:exported="false"
+                      android:excludeFromRecents="true"
+                      android:taskAffinity=""
+                      android:launchMode="singleInstance" />
+
+                  <service
+                      android:name=".MonitorService"
+                      android:exported="false"
+                      android:foregroundServiceType="specialUse">
+                      <property
+                          android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                          android:value="Detects when a user-selected distracting app opens and shows a pause screen" />
+                  </service>
+
+                  <receiver android:name=".BootReceiver" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.BOOT_COMPLETED" />
+                      </intent-filter>
+                  </receiver>
+              </application>
+          </manifest>
+          STILLPOINT_EOF
+          mkdir -p "$(dirname 'app/src/main/java/com/stillpoint/app/BootReceiver.kt')"
+          cat > 'app/src/main/java/com/stillpoint/app/BootReceiver.kt' <<'STILLPOINT_EOF'
+          package com.stillpoint.app
+
+          import android.content.BroadcastReceiver
+          import android.content.Context
+          import android.content.Intent
+
+          class BootReceiver : BroadcastReceiver() {
+              override fun onReceive(context: Context, intent: Intent) {
+                  if (Prefs.enabled(context)) {
+                      context.startForegroundService(Intent(context, MonitorService::class.java))
+                  }
+              }
+          }
+          STILLPOINT_EOF
+          mkdir -p "$(dirname 'app/src/main/java/com/stillpoint/app/MainActivity.kt')"
+          cat > 'app/src/main/java/com/stillpoint/app/MainActivity.kt' <<'STILLPOINT_EOF'
+          package com.stillpoint.app
+
+          import android.Manifest
+          import android.app.Activity
+          import android.app.AppOpsManager
+          import android.content.Intent
+          import android.graphics.Color
+          import android.net.Uri
+          import android.os.Build
+          import android.os.Bundle
+          import android.os.Process
+          import android.provider.Settings
+          import android.view.Gravity
+          import android.widget.*
+
+          class MainActivity : Activity() {
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  if (Build.VERSION.SDK_INT >= 33) {
+                      requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 1)
+                  }
+              }
+
+              override fun onResume() {
+                  super.onResume()
+                  render()
+              }
+
+              private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+
+              private fun hasUsage(): Boolean {
+                  val ops = getSystemService(APP_OPS_SERVICE) as AppOpsManager
+                  return ops.checkOpNoThrow(AppOpsManager.OPSTR_GET_USAGE_STATS, Process.myUid(), packageName) ==
+                      AppOpsManager.MODE_ALLOWED
+              }
+
+              private fun render() {
+                  val root = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(dp(20), dp(48), dp(20), dp(24))
+                  }
+                  fun text(s: String, size: Float, color: Int = Color.BLACK) = TextView(this).apply {
+                      text = s; textSize = size; setTextColor(color); setPadding(0, dp(6), 0, dp(6))
+                  }
+
+                  root.addView(text("Stillpoint", 30f))
+                  root.addView(text("A breath before the scroll.", 15f, Color.GRAY))
+
+                  val usageOk = hasUsage()
+                  root.addView(Button(this).apply {
+                      text = if (usageOk) "✓ Usage access granted" else "1. Grant usage access"
+                      setOnClickListener { startActivity(Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS)) }
+                  })
+
+                  val overlayOk = Settings.canDrawOverlays(this)
+                  root.addView(Button(this).apply {
+                      text = if (overlayOk) "✓ Display over apps granted" else "2. Allow display over other apps"
+                      setOnClickListener {
+                          startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName")))
+                      }
+                  })
+
+                  val on = Prefs.enabled(this)
+                  root.addView(Button(this).apply {
+                      text = if (on) "Stop protection" else "3. Start protection"
+                      setOnClickListener {
+                          if (!on && !(hasUsage() && Settings.canDrawOverlays(this@MainActivity))) {
+                              Toast.makeText(this@MainActivity, "Grant both permissions first", Toast.LENGTH_SHORT).show()
+                              return@setOnClickListener
+                          }
+                          Prefs.setEnabled(this@MainActivity, !on)
+                          val svc = Intent(this@MainActivity, MonitorService::class.java)
+                          if (!on) startForegroundService(svc) else stopService(svc)
+                          render()
+                      }
+                  })
+
+                  // Pause length
+                  val row = LinearLayout(this).apply { gravity = Gravity.CENTER_VERTICAL }
+                  val lbl = text("Pause length: ${Prefs.pauseSeconds(this)}s", 16f)
+                  row.addView(lbl, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+                  row.addView(Button(this).apply {
+                      text = "−"
+                      setOnClickListener {
+                          Prefs.setPauseSeconds(this@MainActivity, Prefs.pauseSeconds(this@MainActivity) - 5)
+                          lbl.text = "Pause length: ${Prefs.pauseSeconds(this@MainActivity)}s"
+                      }
+                  })
+                  row.addView(Button(this).apply {
+                      text = "+"
+                      setOnClickListener {
+                          Prefs.setPauseSeconds(this@MainActivity, Prefs.pauseSeconds(this@MainActivity) + 5)
+                          lbl.text = "Pause length: ${Prefs.pauseSeconds(this@MainActivity)}s"
+                      }
+                  })
+                  root.addView(row)
+
+                  root.addView(text("Apps to pause", 20f))
+                  val selected = Prefs.blocked(this).toMutableSet()
+                  val launcher = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
+                  val apps = packageManager.queryIntentActivities(launcher, 0)
+                      .map { it.loadLabel(packageManager).toString() to it.activityInfo.packageName }
+                      .filter { it.second != packageName }
+                      .distinctBy { it.second }
+                      .sortedBy { it.first.lowercase() }
+
+                  for ((name, pkg) in apps) {
+                      root.addView(CheckBox(this).apply {
+                          text = name
+                          isChecked = pkg in selected
+                          setOnCheckedChangeListener { _, checked ->
+                              if (checked) selected.add(pkg) else selected.remove(pkg)
+                              Prefs.setBlocked(this@MainActivity, selected)
+                          }
+                      })
+                  }
+
+                  setContentView(ScrollView(this).apply { addView(root) })
+              }
+          }
+          STILLPOINT_EOF
+          mkdir -p "$(dirname 'app/src/main/java/com/stillpoint/app/MonitorService.kt')"
+          cat > 'app/src/main/java/com/stillpoint/app/MonitorService.kt' <<'STILLPOINT_EOF'
+          package com.stillpoint.app
+
+          import android.app.*
+          import android.app.usage.UsageEvents
+          import android.app.usage.UsageStatsManager
+          import android.content.Context
+          import android.content.Intent
+          import android.content.pm.ServiceInfo
+          import android.os.Build
+          import android.os.Handler
+          import android.os.IBinder
+          import android.os.Looper
+          import android.provider.Settings
+
+          class MonitorService : Service() {
+              private val handler = Handler(Looper.getMainLooper())
+              private var lastEventTs = 0L
+              private var lastPrompt = 0L
+
+              private val tick = object : Runnable {
+                  override fun run() {
+                      try { poll() } catch (_: Exception) {}
+                      handler.postDelayed(this, 700)
+                  }
+              }
+
+              override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+                  val nm = getSystemService(NotificationManager::class.java)
+                  nm.createNotificationChannel(NotificationChannel("guard", "Protection", NotificationManager.IMPORTANCE_LOW))
+                  val n = Notification.Builder(this, "guard")
+                      .setContentTitle("Stillpoint is on")
+                      .setContentText("Pausing you before distracting apps open")
+                      .setSmallIcon(android.R.drawable.ic_lock_idle_alarm)
+                      .setOngoing(true)
+                      .build()
+                  if (Build.VERSION.SDK_INT >= 34) {
+                      startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
+                  } else {
+                      startForeground(1, n)
+                  }
+                  lastEventTs = System.currentTimeMillis()
+                  handler.removeCallbacks(tick)
+                  handler.post(tick)
+                  return START_STICKY
+              }
+
+              private fun poll() {
+                  val usm = getSystemService(Context.USAGE_STATS_SERVICE) as UsageStatsManager
+                  val now = System.currentTimeMillis()
+                  val events = usm.queryEvents(now - 10_000, now)
+                  val e = UsageEvents.Event()
+                  while (events.hasNextEvent()) {
+                      events.getNextEvent(e)
+                      if (e.eventType == UsageEvents.Event.MOVE_TO_FOREGROUND && e.timeStamp > lastEventTs) {
+                          lastEventTs = e.timeStamp
+                          handle(e.packageName)
+                      }
+                  }
+              }
+
+              private fun handle(pkg: String) {
+                  if (pkg == packageName) return
+                  if (pkg !in Prefs.blocked(this)) return
+                  val now = System.currentTimeMillis()
+                  if (now < Prefs.allowedUntil(this, pkg)) return
+                  if (PauseActivity.showing || now - lastPrompt < 1500) return
+                  if (!Settings.canDrawOverlays(this)) return
+                  lastPrompt = now
+                  startActivity(
+                      Intent(this, PauseActivity::class.java)
+                          .putExtra("pkg", pkg)
+                          .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_NO_ANIMATION)
+                  )
+              }
+
+              override fun onDestroy() {
+                  handler.removeCallbacks(tick)
+                  super.onDestroy()
+              }
+
+              override fun onBind(intent: Intent?): IBinder? = null
+          }
+          STILLPOINT_EOF
+          mkdir -p "$(dirname 'app/src/main/java/com/stillpoint/app/PauseActivity.kt')"
+          cat > 'app/src/main/java/com/stillpoint/app/PauseActivity.kt' <<'STILLPOINT_EOF'
+          package com.stillpoint.app
+
+          import android.animation.*
+          import android.app.Activity
+          import android.graphics.Color
+          import android.graphics.drawable.GradientDrawable
+          import android.os.Bundle
+          import android.os.CountDownTimer
+          import android.view.Gravity
+          import android.view.View
+          import android.widget.Button
+          import android.widget.LinearLayout
+          import android.widget.TextView
+          import android.content.Intent
+
+          class PauseActivity : Activity() {
+              companion object {
+                  @Volatile var showing = false
+              }
+
+              private var timer: CountDownTimer? = null
+
+              private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  showing = true
+                  val pkg = intent.getStringExtra("pkg") ?: run { finish(); return }
+                  val label = try {
+                      packageManager.getApplicationLabel(packageManager.getApplicationInfo(pkg, 0)).toString()
+                  } catch (e: Exception) { pkg }
+
+                  val root = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      gravity = Gravity.CENTER
+                      setBackgroundColor(Color.parseColor("#101820"))
+                      setPadding(dp(28), dp(28), dp(28), dp(28))
+                  }
+
+                  fun tv(s: String, size: Float, color: String = "#FFFFFF") = TextView(this).apply {
+                      text = s; textSize = size; gravity = Gravity.CENTER
+                      setTextColor(Color.parseColor(color))
+                      setPadding(0, dp(8), 0, dp(8))
+                  }
+
+                  val circle = View(this).apply {
+                      background = GradientDrawable().apply {
+                          shape = GradientDrawable.OVAL
+                          setColor(Color.parseColor("#4FB3A9"))
+                      }
+                      layoutParams = LinearLayout.LayoutParams(dp(180), dp(180)).apply { setMargins(0, dp(24), 0, dp(24)) }
+                      scaleX = 0.6f; scaleY = 0.6f
+                  }
+                  val hint = tv("Breathe in…", 18f, "#BFE6E1")
+                  var breathIn = true
+
+                  ObjectAnimator.ofPropertyValuesHolder(
+                      circle,
+                      PropertyValuesHolder.ofFloat(View.SCALE_X, 0.6f, 1f),
+                      PropertyValuesHolder.ofFloat(View.SCALE_Y, 0.6f, 1f)
+                  ).apply {
+                      duration = 4000
+                      repeatCount = ValueAnimator.INFINITE
+                      repeatMode = ValueAnimator.REVERSE
+                      addListener(object : AnimatorListenerAdapter() {
+                          override fun onAnimationRepeat(a: Animator) {
+                              breathIn = !breathIn
+                              hint.text = if (breathIn) "Breathe in…" else "Breathe out…"
+                          }
+                      })
+                      start()
+                  }
+
+                  val leave = Button(this).apply {
+                      text = "Take me out"
+                      setOnClickListener { goHome() }
+                  }
+                  val cont = Button(this).apply { isEnabled = false }
+                  cont.setOnClickListener {
+                      Prefs.allow(this, pkg)
+                      Prefs.addOpen(this)
+                      finish()
+                  }
+
+                  root.addView(tv("Pause.", 28f))
+                  root.addView(tv("Do you really want to open $label?", 20f))
+                  root.addView(circle)
+                  root.addView(hint)
+                  root.addView(tv("You've continued into distracting apps ${Prefs.opensToday(this)}× today.", 14f, "#8A97A3"))
+                  root.addView(leave)
+                  root.addView(cont)
+                  setContentView(root)
+
+                  val secs = Prefs.pauseSeconds(this)
+                  cont.text = "Continue in ${secs}s"
+                  timer = object : CountDownTimer(secs * 1000L, 1000) {
+                      override fun onTick(ms: Long) { cont.text = "Continue in ${(ms + 999) / 1000}s" }
+                      override fun onFinish() { cont.isEnabled = true; cont.text = "Continue" }
+                  }.start()
+              }
+
+              private fun goHome() {
+                  startActivity(Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_HOME).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+                  finish()
+              }
+
+              @Deprecated("Deprecated in Java")
+              override fun onBackPressed() = goHome()
+
+              override fun onStop() {
+                  super.onStop()
+                  finish()
+              }
+
+              override fun onDestroy() {
+                  showing = false
+                  timer?.cancel()
+                  super.onDestroy()
+              }
+          }
+          STILLPOINT_EOF
+          mkdir -p "$(dirname 'app/src/main/java/com/stillpoint/app/Prefs.kt')"
+          cat > 'app/src/main/java/com/stillpoint/app/Prefs.kt' <<'STILLPOINT_EOF'
+          package com.stillpoint.app
+
+          import android.content.Context
+          import java.time.LocalDate
+
+          object Prefs {
+              private val DEFAULTS = setOf(
+                  "com.instagram.android", "com.zhiliaoapp.musically", "com.ss.android.ugc.trill",
+                  "com.facebook.katana", "com.twitter.android", "com.snapchat.android",
+                  "com.reddit.frontpage", "com.google.android.youtube", "com.pinterest"
+              )
+
+              private fun sp(c: Context) = c.getSharedPreferences("stillpoint", Context.MODE_PRIVATE)
+
+              fun blocked(c: Context): Set<String> = sp(c).getStringSet("blocked", DEFAULTS)!!.toSet()
+              fun setBlocked(c: Context, s: Set<String>) = sp(c).edit().putStringSet("blocked", s).apply()
+
+              fun pauseSeconds(c: Context) = sp(c).getInt("pause", 10)
+              fun setPauseSeconds(c: Context, v: Int) = sp(c).edit().putInt("pause", v.coerceIn(3, 60)).apply()
+
+              // After you tap Continue, the app is left alone for this many minutes.
+              fun graceMinutes(c: Context) = sp(c).getInt("grace", 5)
+
+              fun enabled(c: Context) = sp(c).getBoolean("enabled", false)
+              fun setEnabled(c: Context, v: Boolean) = sp(c).edit().putBoolean("enabled", v).apply()
+
+              fun allowedUntil(c: Context, pkg: String) = sp(c).getLong("allow_$pkg", 0L)
+              fun allow(c: Context, pkg: String) =
+                  sp(c).edit().putLong("allow_$pkg", System.currentTimeMillis() + graceMinutes(c) * 60_000L).apply()
+
+              fun opensToday(c: Context): Int {
+                  val s = sp(c)
+                  return if (s.getString("day", "") == LocalDate.now().toString()) s.getInt("opens", 0) else 0
+              }
+
+              fun addOpen(c: Context) {
+                  val n = opensToday(c) + 1
+                  sp(c).edit().putString("day", LocalDate.now().toString()).putInt("opens", n).apply()
+              }
+          }
+          STILLPOINT_EOF
+          mkdir -p "$(dirname 'app/src/main/res/values/strings.xml')"
+          cat > 'app/src/main/res/values/strings.xml' <<'STILLPOINT_EOF'
+          <resources>
+              <string name="app_name">Stillpoint</string>
+          </resources>
+          STILLPOINT_EOF
+          mkdir -p "$(dirname 'build.gradle.kts')"
+          cat > 'build.gradle.kts' <<'STILLPOINT_EOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          STILLPOINT_EOF
+          mkdir -p "$(dirname 'gradle.properties')"
+          cat > 'gradle.properties' <<'STILLPOINT_EOF'
+          org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
+          kotlin.code.style=official
+          STILLPOINT_EOF
+          mkdir -p "$(dirname 'gradle/wrapper/gradle-wrapper.properties')"
+          cat > 'gradle/wrapper/gradle-wrapper.properties' <<'STILLPOINT_EOF'
+          distributionBase=GRADLE_USER_HOME
+          distributionPath=wrapper/dists
+          distributionUrl=https\://services.gradle.org/distributions/gradle-8.7-bin.zip
+          zipStoreBase=GRADLE_USER_HOME
+          zipStorePath=wrapper/dists
+          STILLPOINT_EOF
+          mkdir -p "$(dirname 'settings.gradle.kts')"
+          cat > 'settings.gradle.kts' <<'STILLPOINT_EOF'
+          pluginManagement {
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories { google(); mavenCentral() }
+          }
+          rootProject.name = "Stillpoint"
+          include(":app")
+          STILLPOINT_EOF
+      - name: Build debug APK
+        run: cd Stillpoint && gradle assembleDebug --no-daemon
+      - name: Publish APK as a release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cp Stillpoint/app/build/outputs/apk/debug/app-debug.apk Stillpoint.apk
+          gh release create "v${{ github.run_number }}" Stillpoint.apk --title "Stillpoint build ${{ github.run_number }}" --notes "Debug APK"
