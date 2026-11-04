@@ -232,7 +232,8 @@ jobs:
                   stepper(root, "Keys per day", "", 1, { Prefs.dailyKeys(this) }, { Prefs.setDailyKeys(this, it) })
                   stepper(root, "Session length", " min", 1, { Prefs.sessionMinutes(this) }, { Prefs.setSessionMinutes(this, it) })
                   stepper(root, "Breathing pause", "s", 5, { Prefs.pauseSeconds(this) }, { Prefs.setPauseSeconds(this, it) })
-                  stepper(root, "Puzzles per unlock", "", 1, { Prefs.puzzleCount(this) }, { Prefs.setPuzzleCount(this, it) })
+                  stepper(root, "Easy puzzles per unlock", "", 1, { Prefs.puzzleCount(this) }, { Prefs.setPuzzleCount(this, it) })
+                  stepper(root, "Hard puzzles to earn a key", "", 1, { Prefs.earnPuzzles(this) }, { Prefs.setEarnPuzzles(this, it) })
 
                   root.addView(text("Apps to pause", 20f))
                   val selected = Prefs.blocked(this).toMutableSet()
@@ -375,6 +376,7 @@ jobs:
           import android.view.View
           import android.view.WindowManager
           import android.widget.*
+          import kotlin.random.Random
 
           class PauseActivity : Activity() {
               companion object {
@@ -384,7 +386,8 @@ jobs:
               private var timer: CountDownTimer? = null
               private var pkg = ""
               private var step = 1
-              private var total = 2
+              private var total = 1
+              private var earning = false   // true when out of keys and solving hard puzzles
               private var answer = ""
               private lateinit var stepTv: TextView
               private lateinit var prompt: TextView
@@ -407,7 +410,6 @@ jobs:
                       packageManager.getApplicationLabel(packageManager.getApplicationInfo(pkg, 0)).toString()
                   } catch (e: Exception) { pkg }
 
-                  total = Prefs.puzzleCount(this)
                   val keysLeft = Prefs.keysLeft(this)
 
                   val root = LinearLayout(this).apply {
@@ -433,11 +435,10 @@ jobs:
                       if (keysLeft > 0)
                           "Keys left today: $keysLeft of ${Prefs.dailyKeys(this)}. Unlocking gives you ${Prefs.sessionMinutes(this)} min."
                       else
-                          "No keys left today. Come back tomorrow.",
+                          "No keys left today. Earn one more unlock by solving ${Prefs.earnPuzzles(this)} hard puzzles.",
                       14f, "#8A97A3"
                   )
 
-                  // Puzzle panel (hidden until you press Continue)
                   stepTv = tv("", 14f, "#8A97A3")
                   prompt = tv("", 24f)
                   input = EditText(this).apply {
@@ -472,14 +473,50 @@ jobs:
                       addView(root)
                   })
 
-                  if (keysLeft <= 0) {
-                      question.text = "You used all your keys for today."
+                  fun startPuzzles() {
                       circle.visibility = View.GONE
                       hint.visibility = View.GONE
                       cont.visibility = View.GONE
+                      info.visibility = View.GONE
+                      question.text = if (earning) "Solve to earn a key" else "Solve to unlock $label"
+                      panel.visibility = View.VISIBLE
+                      step = 1
+                      newPuzzle()
+                  }
+
+                  check.setOnClickListener {
+                      val ok = input.text.toString().trim().equals(answer, ignoreCase = true)
+                      if (ok) {
+                          if (step >= total) {
+                              if (!earning) Prefs.useKey(this)   // earned unlocks cost no key
+                              Prefs.allow(this, pkg)
+                              finish()
+                          } else {
+                              step++
+                              newPuzzle()
+                          }
+                      } else {
+                          Toast.makeText(this, "Not quite. New puzzle.", Toast.LENGTH_SHORT).show()
+                          newPuzzle()
+                      }
+                  }
+
+                  if (keysLeft <= 0) {
+                      // Out of keys: the only way in is hard puzzles
+                      question.text = "You used all your keys for today."
+                      circle.visibility = View.GONE
+                      hint.visibility = View.GONE
+                      cont.text = "Earn a key"
+                      cont.isEnabled = true
+                      cont.setOnClickListener {
+                          earning = true
+                          total = Prefs.earnPuzzles(this)
+                          startPuzzles()
+                      }
                       return
                   }
 
+                  total = Prefs.puzzleCount(this)
                   var breathIn = true
                   ObjectAnimator.ofPropertyValuesHolder(
                       circle,
@@ -505,45 +542,41 @@ jobs:
                       override fun onFinish() { cont.isEnabled = true; cont.text = "Continue" }
                   }.start()
 
-                  cont.setOnClickListener {
-                      circle.visibility = View.GONE
-                      hint.visibility = View.GONE
-                      cont.visibility = View.GONE
-                      question.text = "Solve to unlock $label"
-                      panel.visibility = View.VISIBLE
-                      step = 1
-                      newPuzzle()
-                  }
-
-                  check.setOnClickListener {
-                      val ok = input.text.toString().trim().equals(answer, ignoreCase = true)
-                      if (ok) {
-                          if (step >= total) {
-                              Prefs.useKey(this)
-                              Prefs.allow(this, pkg)
-                              finish()
-                          } else {
-                              step++
-                              newPuzzle()
-                          }
-                      } else {
-                          Toast.makeText(this, "Not quite. New puzzle.", Toast.LENGTH_SHORT).show()
-                          newPuzzle()
-                      }
-                  }
+                  cont.setOnClickListener { startPuzzles() }
               }
 
               private fun newPuzzle() {
                   stepTv.text = "Puzzle $step of $total"
-                  if (kotlin.random.Random.nextBoolean()) {
-                      val a = kotlin.random.Random.nextInt(12, 49)
-                      val b = kotlin.random.Random.nextInt(3, 10)
-                      val c = kotlin.random.Random.nextInt(10, 100)
+                  val chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+                  if (!earning) {
+                      // Easy: simple sums, times tables, or copy a short code
+                      when (Random.nextInt(3)) {
+                          0 -> {
+                              val a = Random.nextInt(10, 40); val b = Random.nextInt(10, 40)
+                              prompt.text = "$a + $b = ?"
+                              answer = (a + b).toString()
+                              input.inputType = InputType.TYPE_CLASS_NUMBER
+                          }
+                          1 -> {
+                              val a = Random.nextInt(2, 10); val b = Random.nextInt(2, 10)
+                              prompt.text = "$a × $b = ?"
+                              answer = (a * b).toString()
+                              input.inputType = InputType.TYPE_CLASS_NUMBER
+                          }
+                          else -> {
+                              val code = (1..4).map { chars.random() }.joinToString("")
+                              prompt.text = "Type this code:\n$code"
+                              answer = code
+                              input.inputType = InputType.TYPE_CLASS_TEXT or
+                                  InputType.TYPE_TEXT_FLAG_CAP_CHARACTERS or InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
+                          }
+                      }
+                  } else if (Random.nextBoolean()) {
+                      val a = Random.nextInt(12, 49); val b = Random.nextInt(3, 10); val c = Random.nextInt(10, 100)
                       prompt.text = "$a × $b + $c = ?"
                       answer = (a * b + c).toString()
                       input.inputType = InputType.TYPE_CLASS_NUMBER
                   } else {
-                      val chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
                       val code = (1..6).map { chars.random() }.joinToString("")
                       prompt.text = "Type this BACKWARDS:\n$code"
                       answer = code.reversed()
@@ -606,9 +639,13 @@ jobs:
               fun dailyKeys(c: Context) = geti(c, "keys", 3)
               fun setDailyKeys(c: Context, v: Int) = puti(c, "keys", v.coerceIn(1, 20))
 
-              // Puzzles to solve per unlock
-              fun puzzleCount(c: Context) = geti(c, "puzzles", 2)
-              fun setPuzzleCount(c: Context, v: Int) = puti(c, "puzzles", v.coerceIn(1, 5))
+              // Easy puzzles to solve per unlock
+              fun puzzleCount(c: Context) = geti(c, "puzzles_easy", 1)
+              fun setPuzzleCount(c: Context, v: Int) = puti(c, "puzzles_easy", v.coerceIn(1, 5))
+
+              // Harder puzzles to solve to earn an unlock when you are out of keys
+              fun earnPuzzles(c: Context) = geti(c, "puzzles_earn", 3)
+              fun setEarnPuzzles(c: Context, v: Int) = puti(c, "puzzles_earn", v.coerceIn(1, 8))
 
               fun enabled(c: Context) = sp(c).getBoolean("enabled", false)
               fun setEnabled(c: Context, v: Boolean) = sp(c).edit().putBoolean("enabled", v).apply()
