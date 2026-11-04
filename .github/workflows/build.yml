@@ -17,6 +17,11 @@ jobs:
       - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: 8.7
+      - name: Keep the same signing key between builds
+        uses: actions/cache@v4
+        with:
+          path: ~/.android/debug.keystore
+          key: stillpoint-debug-keystore-v1
       - name: Write project files
         run: |
           mkdir -p Stillpoint && cd Stillpoint
@@ -161,12 +166,32 @@ jobs:
                       AppOpsManager.MODE_ALLOWED
               }
 
+              private fun stepper(
+                  root: LinearLayout, label: String, unit: String, step: Int,
+                  get: () -> Int, set: (Int) -> Unit
+              ) {
+                  val row = LinearLayout(this).apply { gravity = Gravity.CENTER_VERTICAL }
+                  val lbl = TextView(this).apply { textSize = 16f; setTextColor(Color.WHITE) }
+                  fun refresh() { lbl.text = "$label: ${get()}$unit" }
+                  refresh()
+                  row.addView(lbl, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+                  row.addView(Button(this).apply {
+                      text = "−"
+                      setOnClickListener { set(get() - step); refresh() }
+                  })
+                  row.addView(Button(this).apply {
+                      text = "+"
+                      setOnClickListener { set(get() + step); refresh() }
+                  })
+                  root.addView(row)
+              }
+
               private fun render() {
                   val root = LinearLayout(this).apply {
                       orientation = LinearLayout.VERTICAL
                       setPadding(dp(20), dp(48), dp(20), dp(24))
                   }
-                  fun text(s: String, size: Float, color: Int = Color.BLACK) = TextView(this).apply {
+                  fun text(s: String, size: Float, color: Int = Color.WHITE) = TextView(this).apply {
                       text = s; textSize = size; setTextColor(color); setPadding(0, dp(6), 0, dp(6))
                   }
 
@@ -202,25 +227,12 @@ jobs:
                       }
                   })
 
-                  // Pause length
-                  val row = LinearLayout(this).apply { gravity = Gravity.CENTER_VERTICAL }
-                  val lbl = text("Pause length: ${Prefs.pauseSeconds(this)}s", 16f)
-                  row.addView(lbl, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
-                  row.addView(Button(this).apply {
-                      text = "−"
-                      setOnClickListener {
-                          Prefs.setPauseSeconds(this@MainActivity, Prefs.pauseSeconds(this@MainActivity) - 5)
-                          lbl.text = "Pause length: ${Prefs.pauseSeconds(this@MainActivity)}s"
-                      }
-                  })
-                  row.addView(Button(this).apply {
-                      text = "+"
-                      setOnClickListener {
-                          Prefs.setPauseSeconds(this@MainActivity, Prefs.pauseSeconds(this@MainActivity) + 5)
-                          lbl.text = "Pause length: ${Prefs.pauseSeconds(this@MainActivity)}s"
-                      }
-                  })
-                  root.addView(row)
+                  root.addView(text("Rules", 20f))
+                  root.addView(text("Keys left today: ${Prefs.keysLeft(this)}", 15f, Color.GRAY))
+                  stepper(root, "Keys per day", "", 1, { Prefs.dailyKeys(this) }, { Prefs.setDailyKeys(this, it) })
+                  stepper(root, "Session length", " min", 1, { Prefs.sessionMinutes(this) }, { Prefs.setSessionMinutes(this, it) })
+                  stepper(root, "Breathing pause", "s", 5, { Prefs.pauseSeconds(this) }, { Prefs.setPauseSeconds(this, it) })
+                  stepper(root, "Puzzles per unlock", "", 1, { Prefs.puzzleCount(this) }, { Prefs.setPuzzleCount(this, it) })
 
                   root.addView(text("Apps to pause", 20f))
                   val selected = Prefs.blocked(this).toMutableSet()
@@ -234,6 +246,7 @@ jobs:
                   for ((name, pkg) in apps) {
                       root.addView(CheckBox(this).apply {
                           text = name
+                          setTextColor(Color.WHITE)
                           isChecked = pkg in selected
                           setOnCheckedChangeListener { _, checked ->
                               if (checked) selected.add(pkg) else selected.remove(pkg)
@@ -242,7 +255,10 @@ jobs:
                       })
                   }
 
-                  setContentView(ScrollView(this).apply { addView(root) })
+                  setContentView(ScrollView(this).apply {
+                      setBackgroundColor(Color.parseColor("#101820"))
+                      addView(root)
+                  })
               }
           }
           STILLPOINT_EOF
@@ -264,7 +280,8 @@ jobs:
 
           class MonitorService : Service() {
               private val handler = Handler(Looper.getMainLooper())
-              private var lastEventTs = 0L
+              private var lastTs = 0L
+              private var current: String? = null   // app currently on screen
               private var lastPrompt = 0L
 
               private val tick = object : Runnable {
@@ -288,32 +305,43 @@ jobs:
                   } else {
                       startForeground(1, n)
                   }
-                  lastEventTs = System.currentTimeMillis()
+                  // Work out which app is already open right now
+                  try {
+                      val usm = getSystemService(Context.USAGE_STATS_SERVICE) as UsageStatsManager
+                      val now = System.currentTimeMillis()
+                      process(usm.queryEvents(now - 6 * 3600_000L, now))
+                  } catch (_: Exception) {}
+                  if (lastTs == 0L) lastTs = System.currentTimeMillis()
                   handler.removeCallbacks(tick)
                   handler.post(tick)
                   return START_STICKY
               }
 
-              private fun poll() {
-                  val usm = getSystemService(Context.USAGE_STATS_SERVICE) as UsageStatsManager
-                  val now = System.currentTimeMillis()
-                  val events = usm.queryEvents(now - 10_000, now)
+              private fun process(events: UsageEvents) {
                   val e = UsageEvents.Event()
                   while (events.hasNextEvent()) {
                       events.getNextEvent(e)
-                      if (e.eventType == UsageEvents.Event.MOVE_TO_FOREGROUND && e.timeStamp > lastEventTs) {
-                          lastEventTs = e.timeStamp
-                          handle(e.packageName)
+                      when (e.eventType) {
+                          UsageEvents.Event.MOVE_TO_FOREGROUND -> current = e.packageName
+                          UsageEvents.Event.MOVE_TO_BACKGROUND -> if (current == e.packageName) current = null
                       }
+                      if (e.timeStamp > lastTs) lastTs = e.timeStamp
                   }
               }
 
-              private fun handle(pkg: String) {
-                  if (pkg == packageName) return
-                  if (pkg !in Prefs.blocked(this)) return
+              private fun poll() {
+                  val usm = getSystemService(Context.USAGE_STATS_SERVICE) as UsageStatsManager
+                  process(usm.queryEvents(lastTs + 1, System.currentTimeMillis()))
+                  check()
+              }
+
+              // Runs every tick: covers apps opened before protection started and sessions that run out
+              private fun check() {
+                  val pkg = current ?: return
+                  if (pkg == packageName || pkg !in Prefs.blocked(this)) return
                   val now = System.currentTimeMillis()
                   if (now < Prefs.allowedUntil(this, pkg)) return
-                  if (PauseActivity.showing || now - lastPrompt < 1500) return
+                  if (PauseActivity.showing || now - lastPrompt < 2000) return
                   if (!Settings.canDrawOverlays(this)) return
                   lastPrompt = now
                   startActivity(
@@ -337,16 +365,16 @@ jobs:
 
           import android.animation.*
           import android.app.Activity
+          import android.content.Intent
           import android.graphics.Color
           import android.graphics.drawable.GradientDrawable
           import android.os.Bundle
           import android.os.CountDownTimer
+          import android.text.InputType
           import android.view.Gravity
           import android.view.View
-          import android.widget.Button
-          import android.widget.LinearLayout
-          import android.widget.TextView
-          import android.content.Intent
+          import android.view.WindowManager
+          import android.widget.*
 
           class PauseActivity : Activity() {
               companion object {
@@ -354,29 +382,42 @@ jobs:
               }
 
               private var timer: CountDownTimer? = null
+              private var pkg = ""
+              private var step = 1
+              private var total = 2
+              private var answer = ""
+              private lateinit var stepTv: TextView
+              private lateinit var prompt: TextView
+              private lateinit var input: EditText
 
               private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+
+              private fun tv(s: String, size: Float, color: String = "#FFFFFF") = TextView(this).apply {
+                  text = s; textSize = size; gravity = Gravity.CENTER
+                  setTextColor(Color.parseColor(color))
+                  setPadding(0, dp(8), 0, dp(8))
+              }
 
               override fun onCreate(savedInstanceState: Bundle?) {
                   super.onCreate(savedInstanceState)
                   showing = true
-                  val pkg = intent.getStringExtra("pkg") ?: run { finish(); return }
+                  window.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE)
+                  pkg = intent.getStringExtra("pkg") ?: run { finish(); return }
                   val label = try {
                       packageManager.getApplicationLabel(packageManager.getApplicationInfo(pkg, 0)).toString()
                   } catch (e: Exception) { pkg }
 
+                  total = Prefs.puzzleCount(this)
+                  val keysLeft = Prefs.keysLeft(this)
+
                   val root = LinearLayout(this).apply {
                       orientation = LinearLayout.VERTICAL
                       gravity = Gravity.CENTER
-                      setBackgroundColor(Color.parseColor("#101820"))
                       setPadding(dp(28), dp(28), dp(28), dp(28))
                   }
 
-                  fun tv(s: String, size: Float, color: String = "#FFFFFF") = TextView(this).apply {
-                      text = s; textSize = size; gravity = Gravity.CENTER
-                      setTextColor(Color.parseColor(color))
-                      setPadding(0, dp(8), 0, dp(8))
-                  }
+                  val title = tv("Pause.", 28f)
+                  val question = tv("Do you really want to use $label?", 20f)
 
                   val circle = View(this).apply {
                       background = GradientDrawable().apply {
@@ -387,8 +428,59 @@ jobs:
                       scaleX = 0.6f; scaleY = 0.6f
                   }
                   val hint = tv("Breathe in…", 18f, "#BFE6E1")
-                  var breathIn = true
 
+                  val info = tv(
+                      if (keysLeft > 0)
+                          "Keys left today: $keysLeft of ${Prefs.dailyKeys(this)}. Unlocking gives you ${Prefs.sessionMinutes(this)} min."
+                      else
+                          "No keys left today. Come back tomorrow.",
+                      14f, "#8A97A3"
+                  )
+
+                  // Puzzle panel (hidden until you press Continue)
+                  stepTv = tv("", 14f, "#8A97A3")
+                  prompt = tv("", 24f)
+                  input = EditText(this).apply {
+                      setTextColor(Color.WHITE)
+                      gravity = Gravity.CENTER
+                      textSize = 24f
+                  }
+                  val check = Button(this).apply { text = "Check" }
+                  val panel = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      visibility = View.GONE
+                      addView(stepTv); addView(prompt); addView(input); addView(check)
+                  }
+
+                  val leave = Button(this).apply {
+                      text = "Take me out"
+                      setOnClickListener { goHome() }
+                  }
+                  val cont = Button(this).apply { isEnabled = false }
+
+                  root.addView(title)
+                  root.addView(question)
+                  root.addView(circle)
+                  root.addView(hint)
+                  root.addView(info)
+                  root.addView(panel)
+                  root.addView(cont)
+                  root.addView(leave)
+                  setContentView(ScrollView(this).apply {
+                      isFillViewport = true
+                      setBackgroundColor(Color.parseColor("#101820"))
+                      addView(root)
+                  })
+
+                  if (keysLeft <= 0) {
+                      question.text = "You used all your keys for today."
+                      circle.visibility = View.GONE
+                      hint.visibility = View.GONE
+                      cont.visibility = View.GONE
+                      return
+                  }
+
+                  var breathIn = true
                   ObjectAnimator.ofPropertyValuesHolder(
                       circle,
                       PropertyValuesHolder.ofFloat(View.SCALE_X, 0.6f, 1f),
@@ -406,32 +498,59 @@ jobs:
                       start()
                   }
 
-                  val leave = Button(this).apply {
-                      text = "Take me out"
-                      setOnClickListener { goHome() }
-                  }
-                  val cont = Button(this).apply { isEnabled = false }
-                  cont.setOnClickListener {
-                      Prefs.allow(this, pkg)
-                      Prefs.addOpen(this)
-                      finish()
-                  }
-
-                  root.addView(tv("Pause.", 28f))
-                  root.addView(tv("Do you really want to open $label?", 20f))
-                  root.addView(circle)
-                  root.addView(hint)
-                  root.addView(tv("You've continued into distracting apps ${Prefs.opensToday(this)}× today.", 14f, "#8A97A3"))
-                  root.addView(leave)
-                  root.addView(cont)
-                  setContentView(root)
-
                   val secs = Prefs.pauseSeconds(this)
                   cont.text = "Continue in ${secs}s"
                   timer = object : CountDownTimer(secs * 1000L, 1000) {
                       override fun onTick(ms: Long) { cont.text = "Continue in ${(ms + 999) / 1000}s" }
                       override fun onFinish() { cont.isEnabled = true; cont.text = "Continue" }
                   }.start()
+
+                  cont.setOnClickListener {
+                      circle.visibility = View.GONE
+                      hint.visibility = View.GONE
+                      cont.visibility = View.GONE
+                      question.text = "Solve to unlock $label"
+                      panel.visibility = View.VISIBLE
+                      step = 1
+                      newPuzzle()
+                  }
+
+                  check.setOnClickListener {
+                      val ok = input.text.toString().trim().equals(answer, ignoreCase = true)
+                      if (ok) {
+                          if (step >= total) {
+                              Prefs.useKey(this)
+                              Prefs.allow(this, pkg)
+                              finish()
+                          } else {
+                              step++
+                              newPuzzle()
+                          }
+                      } else {
+                          Toast.makeText(this, "Not quite. New puzzle.", Toast.LENGTH_SHORT).show()
+                          newPuzzle()
+                      }
+                  }
+              }
+
+              private fun newPuzzle() {
+                  stepTv.text = "Puzzle $step of $total"
+                  if (kotlin.random.Random.nextBoolean()) {
+                      val a = kotlin.random.Random.nextInt(12, 49)
+                      val b = kotlin.random.Random.nextInt(3, 10)
+                      val c = kotlin.random.Random.nextInt(10, 100)
+                      prompt.text = "$a × $b + $c = ?"
+                      answer = (a * b + c).toString()
+                      input.inputType = InputType.TYPE_CLASS_NUMBER
+                  } else {
+                      val chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+                      val code = (1..6).map { chars.random() }.joinToString("")
+                      prompt.text = "Type this BACKWARDS:\n$code"
+                      answer = code.reversed()
+                      input.inputType = InputType.TYPE_CLASS_TEXT or
+                          InputType.TYPE_TEXT_FLAG_CAP_CHARACTERS or InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
+                  }
+                  input.setText("")
               }
 
               private fun goHome() {
@@ -469,31 +588,45 @@ jobs:
               )
 
               private fun sp(c: Context) = c.getSharedPreferences("stillpoint", Context.MODE_PRIVATE)
+              private fun geti(c: Context, k: String, d: Int) = sp(c).getInt(k, d)
+              private fun puti(c: Context, k: String, v: Int) = sp(c).edit().putInt(k, v).apply()
 
               fun blocked(c: Context): Set<String> = sp(c).getStringSet("blocked", DEFAULTS)!!.toSet()
               fun setBlocked(c: Context, s: Set<String>) = sp(c).edit().putStringSet("blocked", s).apply()
 
-              fun pauseSeconds(c: Context) = sp(c).getInt("pause", 10)
-              fun setPauseSeconds(c: Context, v: Int) = sp(c).edit().putInt("pause", v.coerceIn(3, 60)).apply()
+              // Seconds of breathing before the puzzle can start
+              fun pauseSeconds(c: Context) = geti(c, "pause", 10)
+              fun setPauseSeconds(c: Context, v: Int) = puti(c, "pause", v.coerceIn(3, 60))
 
-              // After you tap Continue, the app is left alone for this many minutes.
-              fun graceMinutes(c: Context) = sp(c).getInt("grace", 5)
+              // Minutes you get after unlocking, then the pause comes back
+              fun sessionMinutes(c: Context) = geti(c, "session", 5)
+              fun setSessionMinutes(c: Context, v: Int) = puti(c, "session", v.coerceIn(1, 60))
+
+              // Unlocks allowed per day
+              fun dailyKeys(c: Context) = geti(c, "keys", 3)
+              fun setDailyKeys(c: Context, v: Int) = puti(c, "keys", v.coerceIn(1, 20))
+
+              // Puzzles to solve per unlock
+              fun puzzleCount(c: Context) = geti(c, "puzzles", 2)
+              fun setPuzzleCount(c: Context, v: Int) = puti(c, "puzzles", v.coerceIn(1, 5))
 
               fun enabled(c: Context) = sp(c).getBoolean("enabled", false)
               fun setEnabled(c: Context, v: Boolean) = sp(c).edit().putBoolean("enabled", v).apply()
 
               fun allowedUntil(c: Context, pkg: String) = sp(c).getLong("allow_$pkg", 0L)
               fun allow(c: Context, pkg: String) =
-                  sp(c).edit().putLong("allow_$pkg", System.currentTimeMillis() + graceMinutes(c) * 60_000L).apply()
+                  sp(c).edit().putLong("allow_$pkg", System.currentTimeMillis() + sessionMinutes(c) * 60_000L).apply()
 
-              fun opensToday(c: Context): Int {
+              fun keysUsedToday(c: Context): Int {
                   val s = sp(c)
-                  return if (s.getString("day", "") == LocalDate.now().toString()) s.getInt("opens", 0) else 0
+                  return if (s.getString("day", "") == LocalDate.now().toString()) s.getInt("used", 0) else 0
               }
 
-              fun addOpen(c: Context) {
-                  val n = opensToday(c) + 1
-                  sp(c).edit().putString("day", LocalDate.now().toString()).putInt("opens", n).apply()
+              fun keysLeft(c: Context) = (dailyKeys(c) - keysUsedToday(c)).coerceAtLeast(0)
+
+              fun useKey(c: Context) {
+                  val n = keysUsedToday(c) + 1
+                  sp(c).edit().putString("day", LocalDate.now().toString()).putInt("used", n).apply()
               }
           }
           STILLPOINT_EOF
